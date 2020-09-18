@@ -5,7 +5,14 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.Security;
+import java.security.cert.Certificate;
 import java.security.spec.InvalidKeySpecException;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,27 +27,38 @@ import javax.crypto.spec.SecretKeySpec;
 import javax.mail.MessagingException;
 import javax.mail.internet.MimeMessage;
 
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.DefaultHttpClient;
+import org.apache.http.util.EntityUtils;
+import org.apache.log4j.varia.NullAppender;
 import org.apache.xml.security.utils.JavaUtils;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.model.Message;
 
+import model.mailclient.MailBody;
 import support.MailHelper;
 import support.MailReader;
 import util.Base64;
 import util.GzipUtil;
+import util.KeyStoreReader;
+import util.MenageSignatures;
 
 public class ReadMailClient extends MailClient {
 
 	public static long PAGE_SIZE = 3;
 	public static boolean ONLY_FIRST_PAGE = true;
 	
-	private static final String KEY_FILE = "./data/session.key";
-	private static final String IV1_FILE = "./data/iv1.bin";
-	private static final String IV2_FILE = "./data/iv2.bin";
+	private static final String USERB_FILE = "./data/userb.jks";
+	private static String userBPassword = "userb";
 	
-	public static void main(String[] args) throws IOException, InvalidKeyException, NoSuchAlgorithmException, InvalidKeySpecException, IllegalBlockSizeException, BadPaddingException, MessagingException, NoSuchPaddingException, InvalidAlgorithmParameterException {
+	public static void main(String[] args) throws IOException, InvalidKeyException, NoSuchAlgorithmException, InvalidKeySpecException, IllegalBlockSizeException, BadPaddingException, MessagingException, NoSuchPaddingException, InvalidAlgorithmParameterException, NoSuchProviderException {
         // Build a new authorized API client service.
+	
+    		
         Gmail service = getGmailService();
         ArrayList<MimeMessage> mimeMessages = new ArrayList<MimeMessage>();
         
@@ -70,38 +88,73 @@ public class ReadMailClient extends MailClient {
         }
         
         System.out.println("Select a message to decrypt:");
-        BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
-	        
+        BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));  
 	    String answerStr = reader.readLine();
 	    Integer answer = Integer.parseInt(answerStr);
 	    
 		MimeMessage chosenMessage = mimeMessages.get(answer);
-	    
-        //TODO: Decrypt a message and decompress it. The private key is stored in a file.
+		
+
+//		dobavljanje privatnog kljuca korisnika B
+		char[] pass = userBPassword.toCharArray();
+		KeyStore keystore = KeyStoreReader.readKeyStore(USERB_FILE, pass);
+		PrivateKey recieverPrivateKey = KeyStoreReader.getPrivateKeyFromKeyStore(keystore, "userb", pass);
+		
+//		Preuzimanje javnog kljuca korisnika A iz njegovog sertifikata koji se nalazi u keystoru korisnika B
+		Certificate certificateSender = KeyStoreReader.getCertificateFromKeyStore(keystore, "usera");
+		PublicKey senderPublicKey = KeyStoreReader.getPublicKeyFromCertificate(certificateSender);
+		
+//		 Sifrovana poruka
+		String textMail = MailHelper.getText(chosenMessage);
+				
+// 		izdvojeni delovi mailbody
+		MailBody mailBody = new MailBody(textMail);		
+		String textMessage = mailBody.getEncMessage();
+				
+		byte[] cipherText = mailBody.getEncMessageBytes();
+		byte[] cipherSecretKey = mailBody.getEncKeyBytes();
+		byte[] signature = mailBody.getSignatureBytes();
+		IvParameterSpec iv1 = new IvParameterSpec(mailBody.getIV1Bytes());
+		IvParameterSpec iv2 = new IvParameterSpec(mailBody.getIV2Bytes());
+
+				
+//		dekriptovanje tajnog kljuca
+		Security.addProvider(new BouncyCastleProvider());
+		Cipher rsaCipherEnc = Cipher.getInstance("RSA/ECB/PKCS1Padding", "BC");		
+		rsaCipherEnc.init(Cipher.DECRYPT_MODE, recieverPrivateKey);
+						
+		byte [] sessionKey = rsaCipherEnc.doFinal(cipherSecretKey);
+					
+//		dekriptovanje i dekompresovanje poruke
 		Cipher aesCipherDec = Cipher.getInstance("AES/CBC/PKCS5Padding");
-		SecretKey secretKey = new SecretKeySpec(JavaUtils.getBytesFromFile(KEY_FILE), "AES");
-		
-		
-		byte[] iv1 = JavaUtils.getBytesFromFile(IV1_FILE);
-		IvParameterSpec ivParameterSpec1 = new IvParameterSpec(iv1);
+		SecretKey secretKey = new SecretKeySpec(sessionKey, "AES");
+				
+		IvParameterSpec ivParameterSpec1 = iv1;
 		aesCipherDec.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec1);
-		
-		String str = MailHelper.getText(chosenMessage);
-		byte[] bodyEnc = Base64.decode(str);
-		
-		String receivedBodyTxt = new String(aesCipherDec.doFinal(bodyEnc));
-		String decompressedBodyText = GzipUtil.decompress(Base64.decode(receivedBodyTxt));
-		System.out.println("Body text: " + decompressedBodyText);
-		
-		
-		byte[] iv2 = JavaUtils.getBytesFromFile(IV2_FILE);
-		IvParameterSpec ivParameterSpec2 = new IvParameterSpec(iv2);
-		//inicijalizacija za dekriptovanje
+					
+		byte[] bodyEnc = Base64.decode(textMessage);
+		String receivedBody = new String(aesCipherDec.doFinal(bodyEnc));
+		String decompressedBody = GzipUtil.decompress(Base64.decode(receivedBody));
+				
+				
+//		inicijalizacija za dekriptovanje
+		IvParameterSpec ivParameterSpec2 = iv2;		
 		aesCipherDec.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec2);
+				
+//		dekompresovanje i dekriptovanje subject-a
+		String decryptedSubject = new String(aesCipherDec.doFinal(Base64.decode(chosenMessage.getSubject())));
+		String decompressedSubject = GzipUtil.decompress(Base64.decode(decryptedSubject));
+												
+		System.out.println("\nSubject text: \n" + new String(decompressedSubject) + "\n");
+		System.out.println("Body text: \n" + decompressedBody);
+				
+//		Provera potpisa
+				
+		if(MenageSignatures.verify(mailBody.getEncMessageBytes(),mailBody.getSignatureBytes() , senderPublicKey)) {
+			System.out.println("\nSignature is verified\n");
+			}else {
+				System.out.println("\nSignature is not verified\n");
+			}
 		
-		//dekompresovanje i dekriptovanje subject-a
-		String decryptedSubjectTxt = new String(aesCipherDec.doFinal(Base64.decode(chosenMessage.getSubject())));
-		String decompressedSubjectTxt = GzipUtil.decompress(Base64.decode(decryptedSubjectTxt));
-		System.out.println("Subject text: " + new String(decompressedSubjectTxt));
 	}
 }
